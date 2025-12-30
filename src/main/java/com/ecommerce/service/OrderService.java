@@ -171,6 +171,8 @@ public class OrderService {
         List<OrderItem> orderItems = new ArrayList<>();
         BigDecimal totalAmount = BigDecimal.ZERO;
         int totalItems = 0;
+        // Track old stock values before modification for Kafka events
+        java.util.Map<Long, Integer> oldStockMap = new java.util.HashMap<>();
 
         for (OrderItemRequest itemRequest : request.getItems()) {
             Product product = productRepository.findById(itemRequest.getProductId())
@@ -180,6 +182,9 @@ public class OrderService {
                 throw new RuntimeException("Insufficient stock for product: " + product.getName());
             }
 
+            // Track old stock before modification
+            oldStockMap.put(product.getId(), product.getStock());
+            
             product.setStock(product.getStock() - itemRequest.getQuantity());
             productRepository.save(product);
 
@@ -208,7 +213,7 @@ public class OrderService {
         
         // Send Kafka events
         sendOrderCreatedEvent(savedOrder);
-        sendInventoryUpdatedEvents(savedOrder, "ORDER_CREATED");
+        sendInventoryUpdatedEvents(savedOrder, "ORDER_CREATED", oldStockMap);
         
         return response;
     }
@@ -230,9 +235,16 @@ public class OrderService {
         order.setStatus(request.getStatus());
 
         if (request.getStatus() == OrderStatus.CANCELLED && previousStatus != OrderStatus.CANCELLED) {
+            // Track old stock before restoring inventory
+            java.util.Map<Long, Integer> oldStockMap = new java.util.HashMap<>();
+            for (OrderItem item : order.getItems()) {
+                Product product = item.getProduct();
+                oldStockMap.put(product.getId(), product.getStock());
+            }
+            
             restoreInventory(order);
             order.setPaymentStatus("REFUNDED");
-            sendInventoryUpdatedEvents(order, "ORDER_CANCELLED");
+            sendInventoryUpdatedEvents(order, "ORDER_CANCELLED", oldStockMap);
         }
 
         Order savedOrder = orderRepository.save(order);
@@ -261,6 +273,15 @@ public class OrderService {
             throw new RuntimeException("Cannot update a cancelled order");
         }
 
+        // Track old items' stock and quantities before restoring inventory (for Kafka events)
+        java.util.Map<Long, Integer> oldStockBeforeRestore = new java.util.HashMap<>();
+        java.util.Map<Long, Integer> restoredQuantities = new java.util.HashMap<>();
+        for (OrderItem item : order.getItems()) {
+            Product product = item.getProduct();
+            oldStockBeforeRestore.put(product.getId(), product.getStock());
+            restoredQuantities.put(product.getId(), item.getQuantity());
+        }
+        
         // Restore inventory for existing items
         restoreInventory(order);
         order.getItems().clear();
@@ -273,6 +294,8 @@ public class OrderService {
         List<OrderItem> orderItems = new ArrayList<>();
         BigDecimal totalAmount = BigDecimal.ZERO;
         int totalItems = 0;
+        // Track old stock values before deducting new items (for Kafka events)
+        java.util.Map<Long, Integer> oldStockBeforeDeduction = new java.util.HashMap<>();
 
         for (OrderItemRequest itemRequest : request.getItems()) {
             Product product = productRepository.findById(itemRequest.getProductId())
@@ -282,6 +305,9 @@ public class OrderService {
                 throw new RuntimeException("Insufficient stock for product: " + product.getName());
             }
 
+            // Track old stock before modification
+            oldStockBeforeDeduction.put(product.getId(), product.getStock());
+            
             product.setStock(product.getStock() - itemRequest.getQuantity());
             productRepository.save(product);
 
@@ -305,6 +331,15 @@ public class OrderService {
         order.setTotalItems(totalItems);
 
         Order savedOrder = orderRepository.save(order);
+        
+        // Send Kafka events for inventory updates
+        // First, send events for restored items (if any were removed)
+        if (!oldStockBeforeRestore.isEmpty()) {
+            sendInventoryUpdatedEventsForRestoredItems(order, oldStockBeforeRestore, restoredQuantities);
+        }
+        // Then, send events for newly deducted items
+        sendInventoryUpdatedEvents(savedOrder, "ORDER_UPDATED", oldStockBeforeDeduction);
+        
         return convertToResponse(savedOrder);
     }
 
@@ -344,13 +379,21 @@ public class OrderService {
         OrderStatus previousStatus = order.getStatus();
         order.setStatus(OrderStatus.CANCELLED);
         order.setPaymentStatus("REFUNDED");
+        
+        // Track old stock before restoring inventory
+        java.util.Map<Long, Integer> oldStockMap = new java.util.HashMap<>();
+        for (OrderItem item : order.getItems()) {
+            Product product = item.getProduct();
+            oldStockMap.put(product.getId(), product.getStock());
+        }
+        
         restoreInventory(order);
         
         Order savedOrder = orderRepository.save(order);
         
         // Send Kafka events
         sendOrderStatusChangedEvent(savedOrder, previousStatus);
-        sendInventoryUpdatedEvents(savedOrder, "ORDER_CANCELLED");
+        sendInventoryUpdatedEvents(savedOrder, "ORDER_CANCELLED", oldStockMap);
         
         return convertToResponse(savedOrder);
     }
@@ -419,20 +462,33 @@ public class OrderService {
     
     /**
      * Send inventory updated events to Kafka for all items in the order
+     * @param order The order containing items
+     * @param reason The reason for inventory update (ORDER_CREATED, ORDER_CANCELLED, ORDER_UPDATED)
+     * @param oldStockMap Map of productId -> old stock value (before modification)
      */
-    private void sendInventoryUpdatedEvents(Order order, String reason) {
+    private void sendInventoryUpdatedEvents(Order order, String reason, java.util.Map<Long, Integer> oldStockMap) {
         try {
             for (OrderItem item : order.getItems()) {
                 Product product = item.getProduct();
-                Integer oldStock = product.getStock() - item.getQuantity();
+                Integer oldStock = oldStockMap.getOrDefault(product.getId(), product.getStock());
                 Integer newStock = product.getStock();
+                
+                // Calculate quantity change based on reason
+                Integer quantityChange;
+                if ("ORDER_CANCELLED".equals(reason)) {
+                    // For cancellation, stock was restored, so change is positive
+                    quantityChange = item.getQuantity();
+                } else {
+                    // For creation/update, stock was deducted, so change is negative
+                    quantityChange = -item.getQuantity();
+                }
                 
                 InventoryUpdatedEvent event = new InventoryUpdatedEvent(
                         product.getId(),
                         product.getName(),
                         oldStock,
                         newStock,
-                        reason.equals("ORDER_CANCELLED") ? item.getQuantity() : -item.getQuantity(),
+                        quantityChange,
                         reason,
                         order.getId(),
                         LocalDateTime.now()
@@ -443,6 +499,51 @@ public class OrderService {
         } catch (Exception e) {
             // Log error but don't fail the transaction
             System.err.println("Failed to send InventoryUpdatedEvent: " + e.getMessage());
+        }
+    }
+    
+    /**
+     * Send inventory updated events for items that were restored (for order updates)
+     * This handles the case where old items are removed from an order
+     * @param order The order (items may have been cleared)
+     * @param oldStockMap Map of productId -> stock value before restore (the low value)
+     * @param restoredQuantities Map of productId -> quantity that was restored
+     */
+    private void sendInventoryUpdatedEventsForRestoredItems(Order order, java.util.Map<Long, Integer> oldStockMap, java.util.Map<Long, Integer> restoredQuantities) {
+        try {
+            for (java.util.Map.Entry<Long, Integer> entry : oldStockMap.entrySet()) {
+                Long productId = entry.getKey();
+                Integer oldStock = entry.getValue(); // Stock before restore (low value)
+                Integer restoredQuantity = restoredQuantities.getOrDefault(productId, 0);
+                
+                if (restoredQuantity == 0) {
+                    continue; // Skip if no quantity was restored
+                }
+                
+                Product product = productRepository.findById(productId)
+                        .orElse(null);
+                if (product == null) {
+                    continue;
+                }
+                
+                Integer newStock = product.getStock(); // Stock after restore (high value)
+                
+                InventoryUpdatedEvent event = new InventoryUpdatedEvent(
+                        product.getId(),
+                        product.getName(),
+                        oldStock,
+                        newStock,
+                        restoredQuantity, // Positive quantity change (stock was restored)
+                        "ORDER_UPDATED_ITEM_REMOVED",
+                        order.getId(),
+                        LocalDateTime.now()
+                );
+                
+                kafkaProducerService.sendInventoryUpdatedEvent(event);
+            }
+        } catch (Exception e) {
+            // Log error but don't fail the transaction
+            System.err.println("Failed to send InventoryUpdatedEvent for restored items: " + e.getMessage());
         }
     }
 }
