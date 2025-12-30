@@ -1,0 +1,17 @@
+.git
+.github
+.idea
+.vscode
+target
+node_modules
+**/*.log
+Dockerfile
+docker-compose.yml
+.env
+*.iml
+*.class
+*.swp
+*.tmp
+*.DS_Store
+
+

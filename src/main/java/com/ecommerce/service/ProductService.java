@@ -5,6 +5,9 @@ import com.ecommerce.dto.ProductResponse;
 import com.ecommerce.model.Product;
 import com.ecommerce.repository.ProductRepository;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.cache.annotation.CacheEvict;
+import org.springframework.cache.annotation.Cacheable;
+import org.springframework.cache.annotation.Caching;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.Pageable;
 import org.springframework.stereotype.Service;
@@ -15,7 +18,7 @@ import java.util.stream.Collectors;
 
 /**
  * Product Service
- * Business logic for product management
+ * Business logic for product management with Redis caching
  */
 @Service
 @Transactional
@@ -80,7 +83,9 @@ public class ProductService {
     
     /**
      * Get product by ID
+     * Cached for 15 minutes
      */
+    @Cacheable(value = "product", key = "#id")
     public ProductResponse getProductById(Long id) {
         Product product = productRepository.findById(id)
                 .orElseThrow(() -> new RuntimeException("Product not found with id: " + id));
@@ -115,7 +120,9 @@ public class ProductService {
     
     /**
      * Create a new product
+     * Evicts products cache when new product is created
      */
+    @CacheEvict(value = "products", allEntries = true)
     public ProductResponse createProduct(ProductRequest request) {
         // Check if SKU already exists
         if (request.getSku() != null && !request.getSku().isEmpty()) {
@@ -141,7 +148,12 @@ public class ProductService {
     
     /**
      * Update an existing product
+     * Evicts both product and products cache
      */
+    @Caching(evict = {
+        @CacheEvict(value = "product", key = "#id"),
+        @CacheEvict(value = "products", allEntries = true)
+    })
     public ProductResponse updateProduct(Long id, ProductRequest request) {
         Product product = productRepository.findById(id)
                 .orElseThrow(() -> new RuntimeException("Product not found with id: " + id));
@@ -174,7 +186,12 @@ public class ProductService {
     
     /**
      * Delete a product
+     * Evicts cache when product is deleted
      */
+    @Caching(evict = {
+        @CacheEvict(value = "product", key = "#id"),
+        @CacheEvict(value = "products", allEntries = true)
+    })
     public void deleteProduct(Long id) {
         if (!productRepository.existsById(id)) {
             throw new RuntimeException("Product not found with id: " + id);
@@ -184,7 +201,12 @@ public class ProductService {
     
     /**
      * Soft delete a product (deactivate)
+     * Evicts cache when product is deactivated
      */
+    @Caching(evict = {
+        @CacheEvict(value = "product", key = "#id"),
+        @CacheEvict(value = "products", allEntries = true)
+    })
     public ProductResponse deactivateProduct(Long id) {
         Product product = productRepository.findById(id)
                 .orElseThrow(() -> new RuntimeException("Product not found with id: " + id));
